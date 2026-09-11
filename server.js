@@ -31,6 +31,9 @@ let qrCodeBase64 = null;
 let connectionStatus = 'DISCONNECTED'; // DISCONNECTED | CONNECTING | CONNECTED
 let connectedUser = null;
 
+// In-Memory Message Store to handle Signal protocol retry requests (fixes "Waiting for this message")
+const messageStore = new Map();
+
 async function initWhatsApp() {
     connectionStatus = 'CONNECTING';
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -41,8 +44,19 @@ async function initWhatsApp() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true,
         auth: state,
-        browser: ['SmartWork AI Outreach', 'Chrome', '122.0.0.0'],
-        generateHighQualityLinkPreview: true
+        browser: ['Ubuntu', 'Chrome', '122.0.0.0'],
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: false,
+        defaultQueryTimeoutMs: 60000,
+        getMessage: async (key) => {
+            if (messageStore.has(key.id)) {
+                return messageStore.get(key.id);
+            }
+            return {
+                conversation: 'SmartWork AI Outreach'
+            };
+        }
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -83,11 +97,15 @@ async function initWhatsApp() {
         }
     });
 
-    // Inbound Messages Webhook Forwarding
+    // Inbound Messages & Store Sync
     sock.ev.on('messages.upsert', async (m) => {
         try {
-            if (m.type !== 'notify') return;
             for (const msg of m.messages) {
+                if (msg.key?.id && msg.message) {
+                    messageStore.set(msg.key.id, msg.message);
+                }
+
+                if (m.type !== 'notify') continue;
                 if (msg.key.fromMe) continue; // Skip messages sent by self
 
                 const remoteJid = msg.key.remoteJid || '';
@@ -188,19 +206,45 @@ app.post(['/message/send', '/message/sendText/:instance'], async (req, res) => {
         }
         const recipientJid = `${cleanNum}@s.whatsapp.net`;
 
-        // Check if number exists on WhatsApp
+        // 1. Check if number exists on WhatsApp
+        let targetJid = recipientJid;
         try {
             const checkResult = await sock.onWhatsApp(recipientJid);
             if (!checkResult || checkResult.length === 0 || !checkResult[0].exists) {
                 console.log(`[GATEWAY] Number ${cleanNum} does NOT exist on WhatsApp.`);
                 return res.json({ status: 'not_on_whatsapp', recipient: cleanNum, exists: false });
             }
+            targetJid = checkResult[0].jid || recipientJid;
         } catch (checkErr) {
             console.warn(`[GATEWAY] onWhatsApp verification check error:`, checkErr.message);
         }
 
-        const sentResult = await sock.sendMessage(recipientJid, { text: String(text).trim() });
-        console.log(`[GATEWAY] Message dispatched to ${cleanNum}`);
+        // 2. Presence subscribe & Signal pre-key handshake (prevents "Waiting for this message")
+        try {
+            await sock.presenceSubscribe(targetJid);
+            await sock.sendPresenceUpdate('composing', targetJid);
+        } catch (pErr) {}
+
+        // Small delay for Signal session ratchet handshake
+        await new Promise((r) => setTimeout(r, 600));
+
+        // 3. Send message
+        const sentResult = await sock.sendMessage(targetJid, { text: String(text).trim() });
+
+        try {
+            await sock.sendPresenceUpdate('paused', targetJid);
+        } catch (pErr) {}
+
+        // Store message for retry re-encryption
+        if (sentResult?.key?.id && sentResult?.message) {
+            messageStore.set(sentResult.key.id, sentResult.message);
+            if (messageStore.size > 3000) {
+                const firstKey = messageStore.keys().next().value;
+                messageStore.delete(firstKey);
+            }
+        }
+
+        console.log(`[GATEWAY] Confirmed message dispatched to ${cleanNum} (msgId: ${sentResult?.key?.id})`);
         return res.json({ status: 'sent', recipient: cleanNum, messageId: sentResult?.key?.id, exists: true });
     } catch (err) {
         console.error('[GATEWAY] Send error:', err);
