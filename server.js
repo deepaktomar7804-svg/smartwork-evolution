@@ -145,6 +145,7 @@ app.get('/instance/connect/smartwork_outreach', (req, res) => {
     });
 });
 
+// Check WhatsApp on Number + Send Text Message
 app.post('/message/sendText/smartwork_outreach', async (req, res) => {
     try {
         const { number, text } = req.body;
@@ -152,17 +153,41 @@ app.post('/message/sendText/smartwork_outreach', async (req, res) => {
             return res.status(400).json({ error: 'Missing number or text' });
         }
         if (connectionStatus !== 'CONNECTED' || !sock) {
-            return res.status(503).json({ error: 'WhatsApp not connected. Scan QR first.' });
+            return res.status(503).json({ error: 'WhatsApp not connected. Scan QR code first.', connected: false });
         }
+        
         let cleanNum = number.replace(/\D/g, '');
         if (cleanNum.length === 10) cleanNum = '91' + cleanNum;
         const recipientJid = `${cleanNum}@s.whatsapp.net`;
 
+        // 1. Verify if number exists on WhatsApp
+        try {
+            const [onWaCheck] = await sock.onWhatsApp(recipientJid);
+            if (!onWaCheck || !onWaCheck.exists) {
+                console.log(`[EVOLUTION] ${cleanNum} is NOT on WhatsApp.`);
+                return res.status(200).json({
+                    status: 'not_on_whatsapp',
+                    exists: false,
+                    phone: cleanNum,
+                    message: 'Number does not have an active WhatsApp account.'
+                });
+            }
+        } catch (checkErr) {
+            console.warn(`[EVOLUTION] onWhatsApp check skipped/failed for ${cleanNum}:`, checkErr.message);
+        }
+
+        // 2. Dispatch message
         const sent = await sock.sendMessage(recipientJid, { text: text.trim() });
-        return res.json({ status: 'sent', messageId: sent?.key?.id, phone: cleanNum });
+        console.log(`[EVOLUTION] Real WhatsApp message sent to ${cleanNum}! Message ID: ${sent?.key?.id}`);
+        return res.json({
+            status: 'sent',
+            exists: true,
+            messageId: sent?.key?.id,
+            phone: cleanNum
+        });
     } catch (err) {
         console.error('[EVOLUTION] Send error:', err);
-        return res.status(500).json({ error: err.message });
+        return res.status(500).json({ error: err.message, status: 'error' });
     }
 });
 
